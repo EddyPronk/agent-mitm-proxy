@@ -20,6 +20,7 @@ build-backend = "uv_build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["integration: needs a running proxy and client container (see tests/integration)"]
 
 [tool.ruff]
 line-length = 100
