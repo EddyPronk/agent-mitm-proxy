@@ -1,0 +1,18 @@
+{
+  "_comment": "Copy to services.json (git-ignored) and set the real internal target. Sandboxes see only the name and the paths granted in allowlist.txt ('service:<name> <METHOD> <path>').",
+  "ollama": {
+    "listen": 11434,
+    "target": "http://OLLAMA-HOST-IP:11434",
+    "deny": ["/api/blobs"],
+    "risky": {
+      "POST /api/pull": "downloads a model — can fill the disk",
+      "DELETE /api/delete": "deletes a model",
+      "POST /api/create": "creates or overwrites a model",
+      "POST /api/copy": "copies a model",
+      "POST /api/push": "uploads a model to a registry"
+    },
+    "max_concurrent": 2,
+    "max_body": 10485760,
+    "timeout_s": 600
+  }
+}

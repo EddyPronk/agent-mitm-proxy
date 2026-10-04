@@ -143,13 +143,17 @@ async def main() -> None:
     if not services:
         print(f"forwarder: no services in {services_path}; nothing to do", flush=True)
         return
-    servers = []
-    for svc in services.values():
-        config = uvicorn.Config(make_app(svc, grants, log_path), host="0.0.0.0", port=svc.listen,
-                                log_level="warning", access_log=False)
-        servers.append(uvicorn.Server(config).serve())
-        print(f"forwarder: service {svc.name!r} on :{svc.listen}", flush=True)  # target not printed
-    await asyncio.gather(*servers)
+    servers = [uvicorn.Server(uvicorn.Config(make_app(svc, grants, log_path), host="0.0.0.0",
+                                             port=svc.listen, log_level="warning", access_log=False))
+               for svc in services.values()]
+    tasks = [asyncio.create_task(server.serve()) for server in servers]
+    # Announce only once every port listens: start-forwarder.sh waits for these lines.
+    while not all(server.started for server in servers) and not any(t.done() for t in tasks):
+        await asyncio.sleep(0.05)
+    if all(server.started for server in servers):
+        for svc in services.values():
+            print(f"forwarder: service {svc.name!r} on :{svc.listen}", flush=True)  # target not printed
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
