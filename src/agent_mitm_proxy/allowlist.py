@@ -55,20 +55,47 @@ def allows(entries: Iterable[Entry], host: str, port: int) -> bool:
 
 Resolver = Callable[..., list]
 
+# IPv6 addresses that carry an IPv4 address in their last 32 bits, which Python calls global
+# whatever that IPv4 address is: NAT64 (a gateway translates them to IPv4) and the deprecated
+# IPv4-compatible form. They count as global only if the IPv4 address does.
+_EMBEDS_IPV4 = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("::/96"))
+
+
+def is_global(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(addr, ipaddress.IPv6Address):
+        if addr.ipv4_mapped is not None:
+            return addr.ipv4_mapped.is_global
+        if any(addr in net for net in _EMBEDS_IPV4):
+            return addr.is_global and ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF).is_global
+    return addr.is_global
+
+
+def global_address(host: str, port: int, resolve: Resolver = socket.getaddrinfo) -> str:
+    """The address to connect to for `host`: the first it resolves to, provided every address
+    it resolves to is global. ValueError with the reason otherwise.
+
+    Connect to this address instead of resolving `host` again: a second lookup can answer
+    differently (DNS rebinding) and reach the LAN after the check passed."""
+    try:
+        infos = resolve(host, port, proto=socket.IPPROTO_TCP)
+    except OSError as e:
+        raise ValueError(f"resolve failed: {e}") from None
+    if not infos:
+        raise ValueError("resolve failed: no addresses")
+    addrs = [ipaddress.ip_address(info[4][0]) for info in infos]
+    for addr in addrs:
+        if not is_global(addr):
+            raise ValueError(f"resolves to non-global address {addr}")
+    return str(addrs[0])
+
 
 def non_global_reason(host: str, port: int, resolve: Resolver = socket.getaddrinfo) -> str | None:
     """Why `host` must not be reached (it does not resolve, or resolves to a non-global
     address), or None if every address it resolves to is global."""
     try:
-        infos = resolve(host, port, proto=socket.IPPROTO_TCP)
-    except OSError as e:
-        return f"resolve failed: {e}"
-    if not infos:
-        return "resolve failed: no addresses"
-    for info in infos:
-        addr = ipaddress.ip_address(info[4][0])
-        if not addr.is_global:
-            return f"resolves to non-global address {addr}"
+        global_address(host, port, resolve)
+    except ValueError as e:
+        return str(e)
     return None
 
 

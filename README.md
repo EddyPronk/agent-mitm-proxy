@@ -45,7 +45,9 @@ service:ollama POST /api/chat     an internal service path (see services.example
 ```
 
 A listed host is still refused if it resolves to a private, loopback, link-local or other
-non-global address.
+non-global address (also inside NAT64 and other IPv6 forms of an IPv4 address). The host is
+resolved once, and the proxy connects to the address it checked, so a host can't pass the check
+and then resolve to the LAN for the connection (DNS rebinding).
 
 ### What to keep private
 

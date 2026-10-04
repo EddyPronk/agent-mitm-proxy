@@ -71,6 +71,49 @@ def test_allowlist_plugin_refuses_listed_hosts_that_resolve_to_the_lan(allowlist
     assert record["reason"] == "resolves to non-global address 192.168.15.1"
 
 
+def test_allowlist_plugin_connects_to_the_address_it_checked(allowlist_env, monkeypatch):
+    # DNS rebinding: the first answer is global, every later one is on the LAN.
+    answers = iter(["93.184.215.14"])
+
+    def rebinding(host, port, proto=0):
+        address = next(answers, "192.168.15.1")
+        return [(socket.AF_INET, socket.SOCK_STREAM, proto, "", (address, port))]
+    monkeypatch.setattr(AllowlistPlugin, "resolve", staticmethod(rebinding))
+    plugin = make(AllowlistPlugin)
+    plugin.before_upstream_connection(connect("example.com:443"))
+    # proxy.py passes the host as the client wrote it.
+    assert plugin.resolve_dns("Example.com", 443) == ("93.184.215.14", None)
+    assert plugin.resolve_dns("example.com", 443) == ("93.184.215.14", None)
+
+
+def test_allowlist_plugin_never_lets_proxy_py_resolve_by_itself(allowlist_env):
+    plugin = make(AllowlistPlugin)
+    with pytest.raises(ConnectionRefusedError):
+        plugin.resolve_dns("example.com", 443)      # no check yet
+    plugin.before_upstream_connection(connect("example.com:443"))
+    with pytest.raises(ConnectionRefusedError):
+        plugin.resolve_dns("pypi.org", 443)         # another host than the one checked
+    with pytest.raises(ConnectionRefusedError):
+        plugin.resolve_dns("example.com", 8443)     # another port
+
+
+def test_allowlist_plugin_forgets_the_address_when_a_later_request_is_refused(allowlist_env):
+    plugin = make(AllowlistPlugin)
+    plugin.before_upstream_connection(connect("example.com:443"))
+    with pytest.raises(HttpRequestRejected):
+        plugin.before_upstream_connection(connect("pypi.org:443"))
+    with pytest.raises(ConnectionRefusedError):
+        plugin.resolve_dns("example.com", 443)
+
+
+def test_allowlist_plugin_refuses_to_work_with_the_connection_pool(allowlist_env):
+    plugin = AllowlistPlugin("uid", argparse.Namespace(enable_conn_pool=True), None, None)
+    with pytest.raises(HttpRequestRejected):
+        plugin.before_upstream_connection(connect("example.com:443"))
+    [record] = read_jsonl(allowlist_env / "denied.jsonl")
+    assert "conn-pool" in record["reason"]
+
+
 def test_allowlist_plugin_refuses_even_if_the_log_cannot_be_written(allowlist_env, monkeypatch):
     monkeypatch.setenv(plugins.DENIED_LOG_ENV, str(allowlist_env / "no-such-dir" / "denied.jsonl"))
     with pytest.raises(HttpRequestRejected):

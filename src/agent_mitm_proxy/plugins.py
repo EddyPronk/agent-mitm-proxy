@@ -29,7 +29,7 @@ from proxy.http.exception import HttpRequestRejected
 from proxy.http.parser import HttpParser, httpParserTypes
 from proxy.http.proxy import HttpProxyBasePlugin
 
-from .allowlist import AllowlistFile, non_global_reason
+from .allowlist import AllowlistFile, global_address
 
 ALLOWLIST_ENV = "AGENT_MITM_PROXY_ALLOWLIST"
 DENIED_LOG_ENV = "AGENT_MITM_PROXY_DENIED_LOG"
@@ -64,6 +64,10 @@ class AllowlistPlugin(HttpProxyBasePlugin):
     """Connect upstream only to listed hosts that resolve to global addresses; log refusals.
 
     Runs before the upstream connection is made, for CONNECT (HTTPS) and plain HTTP alike.
+    The host is resolved once, and proxy.py connects to the address that was checked (via
+    resolve_dns), not to the answer of a second lookup: otherwise a host could pass the check
+    with a global address and then resolve to a LAN address for the connection (DNS rebinding).
+    TLS to the upstream server is still verified against the host name.
     """
 
     resolve = staticmethod(socket.getaddrinfo)
@@ -72,16 +76,30 @@ class AllowlistPlugin(HttpProxyBasePlugin):
         super().__init__(*args, **kwargs)
         self.allowlist = _allowlist_file(os.environ.get(ALLOWLIST_ENV, "allowlist.txt"))
         self.denied_log = os.environ.get(DENIED_LOG_ENV, "denied.jsonl")
+        self.checked: tuple[str, int, str] | None = None   # host, port, the address to use
 
     def before_upstream_connection(self, request: HttpParser) -> HttpParser | None:
         host = (request.host or b"").decode("utf-8", "replace").lower()
         port = request.port or (443 if request.method == b"CONNECT" else 80)
+        self.checked = None
+        if getattr(self.flags, "enable_conn_pool", False):
+            # Pooled connections are made without resolve_dns, so the check would not hold.
+            self._deny(host, port, "proxy.py's --enable-conn-pool is not supported")
         if not self.allowlist.allows(host, port):
             self._deny(host, port, "not in allowlist")
-        reason = non_global_reason(host, port, self.resolve)
-        if reason:
-            self._deny(host, port, reason)
+        try:
+            address = global_address(host, port, self.resolve)
+        except ValueError as e:
+            self._deny(host, port, str(e))
+        self.checked = (host, port, address)
         return request
+
+    def resolve_dns(self, host: str, port: int) -> tuple[str | None, tuple[str, int] | None]:
+        """The address checked in before_upstream_connection. Without one, refuse to connect
+        rather than let proxy.py resolve the host itself."""
+        if self.checked is None or self.checked[:2] != (host.lower(), port):
+            raise ConnectionRefusedError(f"no checked address for {host}:{port}")
+        return self.checked[2], None
 
     def _deny(self, host: str, port: int, reason: str) -> None:
         try:
