@@ -5,12 +5,21 @@ description = "A TLS-intercepting egress proxy with an allowlist, for sandboxed 
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-requires-python = ">=3.11"
-dependencies = []
+requires-python = ">=3.12"
+dependencies = [
+    "brotli>=1.1",
+    "buzzkit>=0.3,<0.4",
+    "httpx>=0.27",
+    "mcp>=2.2,<3",
+    "proxy-py>=2.4.10,<2.5",
+    "starlette>=0.40",
+    "uvicorn>=0.30",
+]
 
 [dependency-groups]
 dev = [
     "pytest>=8",
+    "pytest-asyncio>=0.24",
     "ruff>=0.6",
 ]
 
@@ -24,4 +33,4 @@ markers = ["integration: needs a running proxy and client container (see tests/i
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
