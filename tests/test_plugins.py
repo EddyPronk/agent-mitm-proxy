@@ -63,6 +63,30 @@ def test_allowlist_plugin_refuses_and_logs_unlisted_hosts(allowlist_env, host_po
     assert record["reason"] == "not in allowlist"
 
 
+# proxy.py's access log takes the target from the upstream connection, which a refused request
+# never gets: it logged "CONNECT None:None". The plugin fills in what it refused.
+def access_context():
+    return {"client_ip": "10.89.0.3", "server_host": None, "server_port": None,
+            "request_method": "CONNECT", "response_code": None, "response_reason": None}
+
+
+def test_allowlist_plugin_names_a_refused_target_in_the_access_log(allowlist_env):
+    plugin = make(AllowlistPlugin)
+    with pytest.raises(HttpRequestRejected):
+        plugin.before_upstream_connection(connect("pypi.org:443"))
+    context = plugin.on_access_log(access_context())
+    assert (context["server_host"], context["server_port"]) == ("pypi.org", 443)
+    assert (context["response_code"], context["response_reason"]) == ("403", "Forbidden")
+    assert context["client_ip"] == "10.89.0.3", "the rest is passed on"
+
+
+def test_allowlist_plugin_leaves_the_access_log_of_allowed_requests_alone(allowlist_env):
+    plugin = make(AllowlistPlugin)
+    plugin.before_upstream_connection(connect("example.com:443"))
+    context = {**access_context(), "server_host": "93.184.215.14", "server_port": 443}
+    assert plugin.on_access_log(dict(context)) == context
+
+
 def test_allowlist_plugin_refuses_listed_hosts_that_resolve_to_the_lan(allowlist_env, monkeypatch):
     monkeypatch.setattr(AllowlistPlugin, "resolve", resolve_to("192.168.15.1"))
     with pytest.raises(HttpRequestRejected):

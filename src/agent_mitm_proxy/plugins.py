@@ -77,6 +77,7 @@ class AllowlistPlugin(HttpProxyBasePlugin):
         self.allowlist = _allowlist_file(os.environ.get(ALLOWLIST_ENV, "allowlist.txt"))
         self.denied_log = os.environ.get(DENIED_LOG_ENV, "denied.jsonl")
         self.checked: tuple[str, int, str] | None = None   # host, port, the address to use
+        self.refused: tuple[str, int] | None = None         # host, port, for the access log
 
     def before_upstream_connection(self, request: HttpParser) -> HttpParser | None:
         host = (request.host or b"").decode("utf-8", "replace").lower()
@@ -101,7 +102,16 @@ class AllowlistPlugin(HttpProxyBasePlugin):
             raise ConnectionRefusedError(f"no checked address for {host}:{port}")
         return self.checked[2], None
 
+    def on_access_log(self, context: dict[str, Any]) -> dict[str, Any] | None:
+        """proxy.py takes the access log's target from the upstream connection, which a refused
+        request never gets ("CONNECT None:None"): name what was refused, and the 403."""
+        if self.refused and context.get("server_host") is None:
+            context.update(server_host=self.refused[0], server_port=self.refused[1],
+                           response_code="403", response_reason="Forbidden")
+        return context
+
     def _deny(self, host: str, port: int, reason: str) -> None:
+        self.refused = (host, port)
         try:
             _append_jsonl(self.denied_log,
                           {"timestamp": _now(), "host": host, "port": port, "reason": reason})
