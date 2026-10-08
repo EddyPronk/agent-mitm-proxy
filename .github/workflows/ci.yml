@@ -1,0 +1,29 @@
+# Unit tests and lint on every PR and push to main. The integration tests (tests/integration) need a
+# running proxy and client container and are skipped here; podman-agent-sandbox's podman workflow
+# runs the proxy that way (its mitm-proxy template builds a pinned commit of this repo).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.12', '3.13']   # 3.12 is the minimum in pyproject.toml; 3.13 is what deploys
+    env:
+      UV_PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install uv (the version the project is developed with)
+        run: pipx install uv==0.11.8
+      - run: uv sync --locked
+      - run: uv run pytest
+      - run: uv run ruff check
