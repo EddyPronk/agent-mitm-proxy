@@ -34,8 +34,6 @@ import asyncio
 import contextlib
 import dataclasses
 import datetime
-import fcntl
-import ipaddress
 import json
 import os
 import pathlib
@@ -46,7 +44,7 @@ import time
 
 import buzzkit
 
-from .allowlist import allows, non_global_reason, parse
+from .allowlist import append_allowlist, listed, validate
 from .grants import denied, grant_line, load_grants, load_services, normalize_method, normalize_path
 
 
@@ -122,46 +120,6 @@ def owner_reaction(event: dict, owner_pubkey: str) -> tuple[str, str] | None:
     if not buzzkit.verify_event(json.dumps(event)):
         return None                       # forged or altered: ignore
     return targets[-1], decision          # NIP-25: the last e tag is the reacted-to event
-
-
-# -- host validation and the allowlist file ----------------------------------
-
-_LABEL = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
-
-
-def validate(host: str, port: int, resolve=socket.getaddrinfo) -> tuple[str, int]:
-    host = host.strip().lower().rstrip(".")
-    if not 1 <= int(port) <= 65535:
-        raise ValueError("port must be 1-65535")
-    try:
-        ipaddress.ip_address(host)
-    except ValueError:
-        pass                                  # not an IP literal: good
-    else:
-        raise ValueError("IP addresses are not allowed; request a host name")
-    labels = host.split(".")
-    if len(host) > 253 or len(labels) < 2 or not all(_LABEL.match(label) for label in labels):
-        raise ValueError(f"not a valid host name: {host!r}")
-    reason = non_global_reason(host, int(port), resolve)
-    if reason:
-        raise ValueError(f"{host}: {reason}; the proxy refuses it")
-    return host, int(port)
-
-
-def listed(path: pathlib.Path, host: str, port: int) -> bool:
-    try:
-        lines = path.read_text().splitlines()
-    except FileNotFoundError:
-        return False
-    return allows(parse(lines), host, port)
-
-
-def append_allowlist(path: pathlib.Path, entry: str, note: str) -> None:
-    """Append `entry` (host:port or a service grant line) with a comment."""
-    line = entry.ljust(46) + f"# {note}\n"
-    with open(path, "a", encoding="utf-8") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        f.write(line)
 
 
 def _local_time(timestamp: float) -> datetime.datetime:
