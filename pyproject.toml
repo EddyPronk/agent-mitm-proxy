@@ -16,6 +16,9 @@ dependencies = [
     "uvicorn>=0.30",
 ]
 
+[project.scripts]
+approve = "agent_mitm_proxy.approve:main"
+
 [dependency-groups]
 dev = [
     "pytest>=8",
