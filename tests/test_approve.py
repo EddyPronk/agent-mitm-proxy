@@ -3,6 +3,7 @@
 import datetime
 import io
 import json
+import re
 import socket
 
 import pytest
@@ -84,7 +85,7 @@ def test_yes_adds_with_a_comment_enter_and_n_skip(files):
     added = allowlist.splitlines()[1:]
     assert len(added) == 1
     assert added[0].startswith("one.example:443 ")
-    assert "# approved with approve, " in added[0]
+    assert re.search(r"# approved with approve, \d{4}-\d\d-\d\d \d\d:\d\d \S+$", added[0])
     assert "Add three.example:80 to the allowlist? (1×, last 10s ago) [y/N/q]" in out
     assert "Added 1 to " in out
 

@@ -134,7 +134,7 @@ def run(args: argparse.Namespace, *, stdin: TextIO, out: TextIO, interactive: bo
         return 0
 
     added = 0
-    stamp = now.astimezone().strftime("%Y-%m-%d %H:%M")
+    stamp = now.astimezone().strftime("%Y-%m-%d %H:%M %Z")   # the container may be in UTC
     for r in offer:
         print(f"Add {r.entry} to the allowlist? ({r.count}×, last {ago(r.last, now)}) [y/N/q] ",
               end="", file=out, flush=True)
