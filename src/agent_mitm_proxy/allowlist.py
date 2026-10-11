@@ -13,8 +13,11 @@ Even a listed host is refused if it resolves to a private, loopback, link-local 
 non-global address: no LAN or host access through DNS tricks.
 """
 
+import fcntl
 import ipaddress
 import os
+import pathlib
+import re
 import socket
 import threading
 from collections.abc import Callable, Iterable
@@ -128,3 +131,45 @@ class AllowlistFile:
 
     def allows(self, host: str, port: int) -> bool:
         return allows(self.entries(), host, port)
+
+
+# -- adding to the allowlist (the gatekeeper and approve) ----------------------
+
+_LABEL = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
+
+
+def validate(host: str, port: int, resolve: Resolver = socket.getaddrinfo) -> tuple[str, int]:
+    """`host`, `port` normalised, if they may be added to the allowlist; ValueError with the reason
+    otherwise: an IP address, not a valid host name, or a name the proxy would refuse anyway."""
+    host = host.strip().lower().rstrip(".")
+    if not 1 <= int(port) <= 65535:
+        raise ValueError("port must be 1-65535")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass                                  # not an IP literal: good
+    else:
+        raise ValueError("IP addresses are not allowed; request a host name")
+    labels = host.split(".")
+    if len(host) > 253 or len(labels) < 2 or not all(_LABEL.match(label) for label in labels):
+        raise ValueError(f"not a valid host name: {host!r}")
+    reason = non_global_reason(host, int(port), resolve)
+    if reason:
+        raise ValueError(f"{host}: {reason}; the proxy refuses it")
+    return host, int(port)
+
+
+def listed(path: pathlib.Path, host: str, port: int) -> bool:
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError:
+        return False
+    return allows(parse(lines), host, port)
+
+
+def append_allowlist(path: pathlib.Path, entry: str, note: str) -> None:
+    """Append `entry` (host:port or a service grant line) with a comment."""
+    line = entry.ljust(46) + f"# {note}\n"
+    with open(path, "a", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(line)

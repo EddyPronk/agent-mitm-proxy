@@ -23,7 +23,8 @@ image and setup that ties the pieces together are next.
 
 | Module | What | Start with |
 |---|---|---|
-| `allowlist` | Allowlist parsing and matching, the non-global address check | – |
+| `allowlist` | Allowlist parsing and matching, the non-global address check, adding entries | – |
+| `approve` | The `approve` command: go through recent refusals, add the ones you choose | `approve` |
 | `grants` | Internal services (`services.json`) and their per-path grants | – |
 | `plugins` | proxy.py plugins: `AllowlistPlugin` (refuse unlisted or non-global destinations) and `TrafficLogPlugin` (decrypted bodies as JSONL, never headers) | `scripts/start-proxy.sh` |
 | `gatekeeper`, `mcp_server` | MCP tools `request_allowlist` and `get_request_status`; asks the owner on Buzz | `scripts/start-gatekeeper.sh` |
@@ -48,6 +49,31 @@ A listed host is still refused if it resolves to a private, loopback, link-local
 non-global address (also inside NAT64 and other IPv6 forms of an IPv4 address). The host is
 resolved once, and the proxy connects to the address it checked, so a host can't pass the check
 and then resolve to the LAN for the connection (DNS rebinding).
+
+### Approving refused hosts
+
+Every refused connection is logged in `denied.jsonl` (in the data directory). `approve` goes through
+the recent ones, one per host and port, and asks for each one:
+
+```text
+$ approve --since 10m
+Refused in the last 10m (/home/me/proxy-data/denied.jsonl):
+  archive.ubuntu.com:80                       4×  last 2m ago
+Not offered (the proxy refuses these even when listed):
+  169.254.169.254:80                          2×  IP addresses are not allowed; request a host name
+Add archive.ubuntu.com:80 to the allowlist? (4×, last 2m ago) [y/N/q] y
+Added 1 to /workspace/allowlist.txt; the proxy applies it without a restart.
+```
+
+- **`y` adds; Enter or `n` skips; `q` stops.** An added line carries a comment with the date.
+- **Never offered:** hosts already listed, and hosts the proxy would refuse anyway (IP addresses, and
+  names that resolve to non-global addresses such as cloud metadata).
+- **Without a terminal on stdin, or with `--list`, it only lists.** Approving needs a person; piping
+  `y` into it adds nothing.
+- **Paths:** it reads the same variables as the proxy (`AGENT_MITM_PROXY_DATA`,
+  `AGENT_MITM_PROXY_DENIED_LOG`, `AGENT_MITM_PROXY_ALLOWLIST`), or `--denied-log` and `--allowlist`.
+
+Editing the allowlist by hand works just as well.
 
 ### What to keep private
 
