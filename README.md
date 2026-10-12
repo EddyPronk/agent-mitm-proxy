@@ -61,8 +61,8 @@ the same client, the proxy resets that client's connections for it for a while, 
 | Variable | Default | Meaning |
 |---|---|---|
 | `AGENT_MITM_PROXY_BURST_COUNT` | 20 | refusals within `BURST_SECONDS` that make a burst; `0` turns this off |
-| `AGENT_MITM_PROXY_BURST_SECONDS` | 5 | the window |
-| `AGENT_MITM_PROXY_BURST_RESET` | 30 | how long that client's requests for that host:port are reset |
+| `AGENT_MITM_PROXY_BURST_SECONDS` | 5 | the window, at least 1 |
+| `AGENT_MITM_PROXY_BURST_RESET` | 30 | how long that client's requests for that host:port are reset, at least 1 |
 
 - **Allowed requests are never affected:** the allowlist is checked first, so once you approve the
   host, its requests pass at once.

@@ -11,8 +11,8 @@ environment variables, read for each connection:
 | AGENT_MITM_PROXY_DENIED_LOG | denied.jsonl | Refused connections, as JSONL |
 | AGENT_MITM_PROXY_TRAFFIC_LOG | decrypted-traffic.jsonl | Decrypted request and response bodies, as JSONL |
 | AGENT_MITM_PROXY_BURST_COUNT | 20 | Refusals of one host:port from one client within BURST_SECONDS that make a burst; 0: off |
-| AGENT_MITM_PROXY_BURST_SECONDS | 5 | The window for BURST_COUNT |
-| AGENT_MITM_PROXY_BURST_RESET | 30 | Seconds a burst's client gets a TCP reset, without an answer, for that host:port |
+| AGENT_MITM_PROXY_BURST_SECONDS | 5 | The window for BURST_COUNT, at least 1 |
+| AGENT_MITM_PROXY_BURST_RESET | 30 | Seconds (at least 1) a burst's client gets a TCP reset, without an answer, for that host:port |
 
 **Refusal bursts.** A refused request gets a 403 with an explanation. Some clients don't take no for
 an answer: `npm install` (npm 11) retries a refused CONNECT hundreds of times a second, ignoring
@@ -75,7 +75,11 @@ def _env_int(name: str, default: int) -> int:
 
 class _Bursts:
     """Refusals per (client, host, port) in this process: when one turns into a burst, and how many
-    were dropped while it lasted. KEY is any hashable; NOW is time.monotonic()."""
+    were dropped while it lasted. KEY is any hashable; NOW is time.monotonic(). Once more than
+    MAX_KEYS keys are tracked, quiet keys and expired bursts are forgotten, so clients that come and
+    go (each new sandbox has a new address) don't grow it without limit."""
+
+    MAX_KEYS = 10000
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -86,10 +90,14 @@ class _Bursts:
     def refuse(self, key: tuple, now: float, count: int, seconds: float, reset: float) -> tuple[str, int]:
         """How to refuse this one: ("answer", 0) as usual; ("start", N) the burst begins with this
         refusal, the Nth within SECONDS; ("reset", 0) during a burst; or ("after", DROPPED) the first
-        answer after a burst ended, with the number dropped during it."""
+        answer after a burst ended, with the number dropped during it. SECONDS and RESET below 1
+        count as 1: a window of 0 would never see a burst (only COUNT 0 means off)."""
         if count <= 0:
             return "answer", 0
+        seconds, reset = max(seconds, 1), max(reset, 1)
         with self._lock:
+            if len(self._times) + len(self._until) > self.MAX_KEYS:
+                self._sweep(now, seconds)
             until = self._until.get(key)
             if until is not None and now < until:
                 self._dropped[key] = self._dropped.get(key, 0) + 1
@@ -107,9 +115,16 @@ class _Bursts:
                 self._until[key] = now + reset
                 self._dropped[key] = 0
                 return "start", len(times)
-            if len(self._times) > 10000:                  # forget quiet keys now and then
-                self._times = {k: v for k, v in self._times.items() if v and v[-1] > now - seconds}
             return ("after", ended) if ended else ("answer", 0)
+
+    def _sweep(self, now: float, seconds: float) -> None:
+        """Forget keys with no refusal in the window, and bursts that are over (their dropped count
+        goes unreported; the burst's start record is in the log). Called with the lock held."""
+        for key in [k for k, until in self._until.items() if now >= until]:
+            del self._until[key]
+            self._dropped.pop(key, None)
+        self._times = {k: v for k, v in self._times.items()
+                       if k in self._until or (v and v[-1] > now - seconds)}
 
 
 _bursts = _Bursts()

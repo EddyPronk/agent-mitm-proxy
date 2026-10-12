@@ -317,3 +317,37 @@ def test_approve_counts_a_burst_summary_by_its_count():
                          "reason": "not in allowlist"})]
     since = datetime.datetime(2026, 10, 12, tzinfo=datetime.UTC)
     assert read_refused(lines, since)[0].count == 7
+
+
+def test_bursts_forget_expired_bursts_and_quiet_keys():
+    bursts = plugins._Bursts()
+    bursts.MAX_KEYS = 10
+    for i in range(10):                            # 10 clients, each one burst, never back
+        key = (f"10.0.0.{i}", "x.example", 443)
+        assert bursts.refuse(key, 0, 2, 5, 30) == ("answer", 0)
+        assert bursts.refuse(key, 0, 2, 5, 30) == ("start", 2)
+    assert len(bursts._until) == 10
+    bursts.refuse(("10.0.1.1", "x.example", 443), 100, 2, 5, 30)   # all bursts over: the sweep runs
+    assert len(bursts._until) == 0 and len(bursts._dropped) == 0
+    assert list(bursts._times) == [("10.0.1.1", "x.example", 443)]
+
+
+def test_bursts_sweep_keeps_running_bursts():
+    bursts = plugins._Bursts()
+    bursts.MAX_KEYS = 2
+    live = ("10.0.0.1", "x.example", 443)
+    bursts.refuse(live, 0, 2, 5, 30)
+    assert bursts.refuse(live, 0, 2, 5, 30) == ("start", 2)
+    for i in range(3):
+        bursts.refuse((f"10.0.2.{i}", "x.example", 443), 10, 2, 5, 30)
+    assert bursts.refuse(live, 11, 2, 5, 30) == ("reset", 0)      # still in its reset period
+
+
+def test_bursts_a_window_or_reset_below_one_second_counts_as_one():
+    bursts = plugins._Bursts()
+    key = ("10.0.0.1", "x.example", 443)
+    assert bursts.refuse(key, 0.0, 3, 0, 0) == ("answer", 0)
+    assert bursts.refuse(key, 0.1, 3, 0, 0) == ("answer", 0)
+    assert bursts.refuse(key, 0.2, 3, 0, 0) == ("start", 3)       # a window of 0 still sees the burst
+    assert bursts.refuse(key, 0.5, 3, 0, 0) == ("reset", 0)       # reset 0 counts as 1 s
+    assert bursts.refuse(key, 1.3, 3, -5, -5)[0] == "after"
