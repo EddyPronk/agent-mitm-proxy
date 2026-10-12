@@ -56,23 +56,25 @@ class Refused:
 
 
 def read_refused(lines, since: datetime.datetime) -> list[Refused]:
-    """Refusals at or after `since`, one per host:port, the most recent first. Lines that aren't
-    a refusal record (malformed, truncated, no timestamp) are skipped."""
+    """Refusals at or after `since`, one per host:port, the most recent first. A record with a
+    `count` (the proxy's summary after a refusal burst) counts that many. Lines that aren't a refusal
+    record (malformed, truncated, no timestamp) are skipped."""
     by_entry: dict[tuple[str, int], Refused] = {}
     for line in lines:
         try:
             record = json.loads(line)
             when = datetime.datetime.strptime(record["timestamp"], "%Y-%m-%dT%H:%M:%S%z")
             host, port = str(record["host"]).lower(), int(record["port"])
+            count = max(1, int(record.get("count", 1)))
         except (ValueError, KeyError, TypeError):
             continue
         if when < since or not host:
             continue
         seen = by_entry.get((host, port))
         if seen is None:
-            by_entry[(host, port)] = Refused(host, port, 1, when)
+            by_entry[(host, port)] = Refused(host, port, count, when)
         else:
-            seen.count += 1
+            seen.count += count
             seen.last = max(seen.last, when)
     return sorted(by_entry.values(), key=lambda r: r.last, reverse=True)
 

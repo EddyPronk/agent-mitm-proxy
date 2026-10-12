@@ -10,16 +10,31 @@ environment variables, read for each connection:
 | AGENT_MITM_PROXY_ALLOWLIST | allowlist.txt | The allowlist (see `allowlist`); missing: allow nothing |
 | AGENT_MITM_PROXY_DENIED_LOG | denied.jsonl | Refused connections, as JSONL |
 | AGENT_MITM_PROXY_TRAFFIC_LOG | decrypted-traffic.jsonl | Decrypted request and response bodies, as JSONL |
+| AGENT_MITM_PROXY_BURST_COUNT | 20 | Refusals of one host:port from one client within BURST_SECONDS that make a burst; 0: off |
+| AGENT_MITM_PROXY_BURST_SECONDS | 5 | The window for BURST_COUNT, at least 1 |
+| AGENT_MITM_PROXY_BURST_RESET | 30 | Seconds (at least 1) a burst's client gets a TCP reset, without an answer, for that host:port |
+
+**Refusal bursts.** A refused request gets a 403 with an explanation. Some clients don't take no for
+an answer: `npm install` (npm 11) retries a refused CONNECT hundreds of times a second, ignoring
+signals, until killed. A dropped connection it does handle: it retries with pauses and gives up. So
+after BURST_COUNT refusals of the same host:port from the same client address within
+BURST_SECONDS, that client's requests for it are reset without an answer (and without an access log
+line) for BURST_RESET seconds. The denied log gets one record when the burst starts and one with the
+number dropped, instead of one per attempt. Allowed requests are never affected, also for that
+client: the allowlist is checked first, so an approved host passes at once. The counts are per proxy
+process (proxy.py runs one per CPU); a looping client exceeds the threshold in each of them.
 
 The traffic log holds whatever the agent sends and receives: treat it as sensitive. Headers are
 never logged, because they carry credentials.
 """
 
 import base64
+import collections
 import gzip
 import json
 import os
 import socket
+import struct
 import threading
 import time
 from typing import Any
@@ -33,6 +48,9 @@ from .allowlist import AllowlistFile, global_address
 
 ALLOWLIST_ENV = "AGENT_MITM_PROXY_ALLOWLIST"
 DENIED_LOG_ENV = "AGENT_MITM_PROXY_DENIED_LOG"
+BURST_COUNT_ENV = "AGENT_MITM_PROXY_BURST_COUNT"
+BURST_SECONDS_ENV = "AGENT_MITM_PROXY_BURST_SECONDS"
+BURST_RESET_ENV = "AGENT_MITM_PROXY_BURST_RESET"
 TRAFFIC_LOG_ENV = "AGENT_MITM_PROXY_TRAFFIC_LOG"
 
 _log_lock = threading.Lock()
@@ -46,6 +64,70 @@ def _append_jsonl(path: str, record: dict[str, Any]) -> None:
 
 def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+class _Bursts:
+    """Refusals per (client, host, port) in this process: when one turns into a burst, and how many
+    were dropped while it lasted. KEY is any hashable; NOW is time.monotonic(). Once more than
+    MAX_KEYS keys are tracked, quiet keys and expired bursts are forgotten, so clients that come and
+    go (each new sandbox has a new address) don't grow it without limit."""
+
+    MAX_KEYS = 10000
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._times: dict[tuple, collections.deque] = {}
+        self._until: dict[tuple, float] = {}
+        self._dropped: dict[tuple, int] = {}
+
+    def refuse(self, key: tuple, now: float, count: int, seconds: float, reset: float) -> tuple[str, int]:
+        """How to refuse this one: ("answer", 0) as usual; ("start", N) the burst begins with this
+        refusal, the Nth within SECONDS; ("reset", 0) during a burst; or ("after", DROPPED) the first
+        answer after a burst ended, with the number dropped during it. SECONDS and RESET below 1
+        count as 1: a window of 0 would never see a burst (only COUNT 0 means off)."""
+        if count <= 0:
+            return "answer", 0
+        seconds, reset = max(seconds, 1), max(reset, 1)
+        with self._lock:
+            if len(self._times) + len(self._until) > self.MAX_KEYS:
+                self._sweep(now, seconds)
+            until = self._until.get(key)
+            if until is not None and now < until:
+                self._dropped[key] = self._dropped.get(key, 0) + 1
+                return "reset", 0
+            ended = 0
+            if until is not None:                         # the burst is over
+                ended = self._dropped.pop(key, 0)
+                del self._until[key]
+                self._times.pop(key, None)
+            times = self._times.setdefault(key, collections.deque())
+            times.append(now)
+            while times and times[0] <= now - seconds:
+                times.popleft()
+            if len(times) >= count:
+                self._until[key] = now + reset
+                self._dropped[key] = 0
+                return "start", len(times)
+            return ("after", ended) if ended else ("answer", 0)
+
+    def _sweep(self, now: float, seconds: float) -> None:
+        """Forget keys with no refusal in the window, and bursts that are over (their dropped count
+        goes unreported; the burst's start record is in the log). Called with the lock held."""
+        for key in [k for k, until in self._until.items() if now >= until]:
+            del self._until[key]
+            self._dropped.pop(key, None)
+        self._times = {k: v for k, v in self._times.items()
+                       if k in self._until or (v and v[-1] > now - seconds)}
+
+
+_bursts = _Bursts()
 
 
 # proxy.py creates a plugin instance per connection; the allowlist is loaded once per file.
@@ -78,6 +160,7 @@ class AllowlistPlugin(HttpProxyBasePlugin):
         self.denied_log = os.environ.get(DENIED_LOG_ENV, "denied.jsonl")
         self.checked: tuple[str, int, str] | None = None   # host, port, the address to use
         self.refused: tuple[str, int] | None = None         # host, port, for the access log
+        self.dropped = False                                # reset without an answer: no access log
 
     def before_upstream_connection(self, request: HttpParser) -> HttpParser | None:
         host = (request.host or b"").decode("utf-8", "replace").lower()
@@ -104,19 +187,47 @@ class AllowlistPlugin(HttpProxyBasePlugin):
 
     def on_access_log(self, context: dict[str, Any]) -> dict[str, Any] | None:
         """proxy.py takes the access log's target from the upstream connection, which a refused
-        request never gets ("CONNECT None:None"): name what was refused, and the 403."""
+        request never gets ("CONNECT None:None"): name what was refused, and the 403. A request
+        dropped during a refusal burst isn't logged at all (None: handled)."""
+        if self.dropped:
+            return None
         if self.refused and context.get("server_host") is None:
             context.update(server_host=self.refused[0], server_port=self.refused[1],
                            response_code="403", response_reason="Forbidden")
         return context
 
+    def _client_ip(self) -> str:
+        addr = getattr(self.client, "addr", None)
+        return str(addr[0]) if addr else "?"
+
+    def _reset_client(self) -> None:
+        """Make closing the client's socket send a TCP reset (SO_LINGER 0) rather than a FIN."""
+        try:
+            self.client.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        except (AttributeError, OSError):
+            pass  # no socket (tests) or already gone: closing without an answer still works
+
     def _deny(self, host: str, port: int, reason: str) -> None:
         self.refused = (host, port)
-        try:
-            _append_jsonl(self.denied_log,
-                          {"timestamp": _now(), "host": host, "port": port, "reason": reason})
-        except OSError:
-            pass  # refuse the connection even if the log can't be written
+        client = self._client_ip()
+        count = _env_int(BURST_COUNT_ENV, 20)
+        seconds = _env_int(BURST_SECONDS_ENV, 5)
+        reset = _env_int(BURST_RESET_ENV, 30)
+        how, n = _bursts.refuse((client, host, port), time.monotonic(), count, seconds, reset)
+        record = {"timestamp": _now(), "host": host, "port": port, "reason": reason}
+        if how == "start":
+            record.update(client=client, burst=f"{n} refusals within {seconds}s: reset for {reset}s")
+        elif how == "after":
+            record.update(client=client, count=n + 1, burst=f"{n} dropped during the burst before this")
+        if how != "reset":
+            try:
+                _append_jsonl(self.denied_log, record)
+            except OSError:
+                pass  # refuse the connection even if the log can't be written
+        if how in ("start", "reset"):
+            self.dropped = True
+            self._reset_client()
+            raise HttpRequestRejected()                   # no answer: proxy.py closes the connection
         raise HttpRequestRejected(
             status_code=403,
             reason=b"Forbidden",
