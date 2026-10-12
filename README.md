@@ -50,6 +50,35 @@ non-global address (also inside NAT64 and other IPv6 forms of an IPv4 address). 
 resolved once, and the proxy connects to the address it checked, so a host can't pass the check
 and then resolve to the LAN for the connection (DNS rebinding).
 
+### Refusal bursts
+
+A refused request gets a `403 Forbidden` that names the host and why. Some clients ignore it:
+`npm install` (npm 11, empty cache) retries a refused CONNECT hundreds of times a second, ignores
+Ctrl-C, and fills the logs until it's killed. A dropped connection it does handle: it retries a few
+times with pauses, then fails with an error. So after a burst of refusals of the same host:port from
+the same client, the proxy resets that client's connections for it for a while, without an answer:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AGENT_MITM_PROXY_BURST_COUNT` | 20 | refusals within `BURST_SECONDS` that make a burst; `0` turns this off |
+| `AGENT_MITM_PROXY_BURST_SECONDS` | 5 | the window |
+| `AGENT_MITM_PROXY_BURST_RESET` | 30 | how long that client's requests for that host:port are reset |
+
+- **Allowed requests are never affected:** the allowlist is checked first, so once you approve the
+  host, its requests pass at once.
+- **One log record per burst:** `denied.jsonl` gets a record when a burst starts (`"burst"`, the
+  client's address), and one with the number dropped (`"count"`) after it. `approve` adds the
+  counts. Dropped connections get no access log line.
+- **Counts are per proxy process,** and proxy.py runs one per CPU. A looping client exceeds the
+  threshold in each of them, so each logs its own burst record.
+
+Measured with npm 11.19.0 against a refused registry, empty cache:
+
+| | 1.0.0 | 1.1.0 |
+|---|---|---|
+| attempts | 340,264 in 8½ minutes, then `kill -9` | 451, then npm stops by itself after 71 s (`npm error code E403`) |
+| `denied.jsonl` records | 340,264 | 228 |
+
 ### Approving refused hosts
 
 Every refused connection is logged in `denied.jsonl` (in the data directory). `approve` goes through
