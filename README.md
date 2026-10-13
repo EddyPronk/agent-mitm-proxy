@@ -149,6 +149,32 @@ uv run pytest -m "not integration"   # unit tests only
 | `PROXYTEST_BLOCKED` | `example.com` | A host not on the allowlist |
 | `PROXYTEST_LAN` | `192.168.15.1` | A LAN address that must stay unreachable |
 
+### Running the tests in a sandbox
+
+`.devcontainer/` is a [podman-agent-sandbox](https://github.com/EddyPronk/podman-agent-sandbox)
+config for running all the tests, the integration tests included, in a container. It has Python, uv
+and Node.js, and rootless Podman inside to make the proxy and client containers the integration
+tests need. It has no Claude Code: it's for running tests, not for an agent. Running containers
+inside needs a weaker sandbox (capabilities, an unrestricted network), as with the
+`claude-containers` template it comes from.
+
+```sh
+sandbox new --workspace . --inplace            # once (sandbox 0.7.0 or later); NAME: agent-mitm-proxy
+sandbox exec agent-mitm-proxy uv run pytest    # unit tests
+```
+
+For the integration tests, make a proxy and a client inside it, then name the client:
+
+```sh
+sandbox exec agent-mitm-proxy sh -c 'sandbox new proxy --template mitm-proxy \
+    && sandbox new client --template proxy-client && sandbox exec proxy true && sandbox exec client true'
+sandbox exec agent-mitm-proxy env AGENT_MITM_PROXY_CLIENT=client uv run pytest
+```
+
+The proxy inside is built from the `mitm-proxy` template's pinned release, not from your working
+tree: these tests check the proxy as packaged. The virtual environment is kept in the sandbox's home
+(`UV_PROJECT_ENVIRONMENT`), so the project's own `.venv` isn't touched.
+
 ## License
 
 Apache-2.0
