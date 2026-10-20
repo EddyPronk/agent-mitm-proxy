@@ -3,7 +3,8 @@
 A TLS-intercepting egress proxy with an allowlist, for sandboxed coding agents.
 
 A sandboxed coding agent reaches the Internet only through this proxy. The proxy
-intercepts TLS, connects only to hosts on an allowlist, and logs the decrypted traffic. When
+intercepts TLS, connects only to hosts on an allowlist, and logs the decrypted traffic, without
+headers and with the credentials and user identity of known endpoints redacted. When
 the agent needs another host, it asks over MCP; the owner approves or rejects on their phone
 (a signed 👍 / 👎 on Buzz), and an approved host is added to the allowlist
 without a restart. Internal services (e.g. Ollama on the LAN) are reachable only per granted
@@ -26,7 +27,8 @@ image and setup that ties the pieces together are next.
 | `allowlist` | Allowlist parsing and matching, the non-global address check, adding entries | – |
 | `approve` | The `approve` command: go through recent refusals, add the ones you choose | `approve` |
 | `grants` | Internal services (`services.json`) and their per-path grants | – |
-| `plugins` | proxy.py plugins: `AllowlistPlugin` (refuse unlisted or non-global destinations) and `TrafficLogPlugin` (decrypted bodies as JSONL, never headers) | `scripts/start-proxy.sh` |
+| `plugins` | proxy.py plugins: `AllowlistPlugin` (refuse unlisted or non-global destinations) and `TrafficLogPlugin` (decrypted bodies as JSONL, never headers, redacted by `redact`) | `scripts/start-proxy.sh` |
+| `redact` | The credentials and identity fields of known endpoints' JSON bodies, and their redaction ([below](#credentials-and-identity-in-the-traffic-log)) | – |
 | `gatekeeper`, `mcp_server` | MCP tools `request_allowlist` and `get_request_status`; asks the owner on Buzz | `scripts/start-gatekeeper.sh` |
 | `forwarder` | Forwards granted method + path requests to internal services, streaming | `scripts/start-forwarder.sh` |
 
@@ -103,6 +105,43 @@ Added 1 to /workspace/allowlist.txt; the proxy applies it without a restart.
   `AGENT_MITM_PROXY_DENIED_LOG`, `AGENT_MITM_PROXY_ALLOWLIST`), or `--denied-log` and `--allowlist`.
 
 Editing the allowlist by hand works just as well.
+
+### Credentials and identity in the traffic log
+
+`decrypted-traffic.jsonl` keeps bodies, never headers. Some endpoints carry credentials, or the
+user's identity, in their bodies, though, so `redact.FIELD_RULES` nominates each one: the endpoint
+(host, path with `*` for an id, request or response) and the fields' places in its JSON body
+(`*` for any list item, or any key of an object). Their values are logged as `[REDACTED]`, the
+body keeps its key order, and the record's `redacted` lists what was replaced. Redaction is always
+on; there is no setting to turn it off.
+
+A JSON body (an object or array) is logged as JSON, so that jq reads it directly
+(`jq '.body.account'`); any other body (text, an event stream, a JSON scalar) as a string.
+
+| Endpoint | Body | Fields |
+|---|---|---|
+| `platform.claude.com/v1/oauth/token` | request | `code`, `code_verifier`, `refresh_token`, `state` |
+| `platform.claude.com/v1/oauth/token` | response | `access_token`, `refresh_token`, `id_token`, `token_uuid`, `organization.uuid`, `organization.name`, `account.uuid`, `account.email_address` |
+| `platform.claude.com/v1/oauth/token/revoke` | request | `token` |
+| `api.anthropic.com/v1/code/sessions/*/bridge` | response | `worker_jwt` |
+| `api.anthropic.com/v1/messages` | request | `fallback_credit_token`, `metadata.user_id` |
+| `api.anthropic.com/api/eval/*` | request | `attributes.accountUUID`, `attributes.organizationUUID` |
+| `api.anthropic.com/api/eval/*` | response | `features.*.experimentResult.hashValue` |
+| `api.anthropic.com/api/oauth/profile` | response | `account.uuid`, `.email`, `.full_name`, `.display_name`; `organization.uuid`, `.name`, `.payment_auth_hosted_invoice_url` |
+| `api.anthropic.com/api/claude_cli/bootstrap` | response | `oauth_account.account_uuid`, `.account_email`, `.organization_uuid`, `.organization_name` |
+| `api.anthropic.com/api/oauth/claude_cli/roles` | response | `organization_uuid`, `organization_name`, `workspace_uuid`, `workspace_name` |
+| `api.anthropic.com/api/event_logging/v2/batch` | request | `events.*.event_data.auth.account_uuid`, `.organization_uuid` |
+
+Ids that don't point to a person stay (messages', MCP servers', the Claude Code application's),
+and so do ids in request paths, such as `/api/organizations/<uuid>/...`.
+
+- **A nominated body that isn't valid JSON** (an unfinished response, one that couldn't be
+  decompressed) is withheld whole (`"redacted": ["body"]`), and no `body_base64` copy is kept of a
+  body that had anything redacted.
+- **Everything else is logged as it was,** including what the agent itself sends: a key pasted
+  into a prompt, or printed by a tool, is in the log. Treat it as sensitive still.
+- **A new endpoint with credentials** needs a rule: find where they sit by the shape of the logged
+  bodies (key names and types, not values), then add it with a test.
 
 ### What to keep private
 

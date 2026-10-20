@@ -9,7 +9,7 @@ environment variables, read for each connection:
 |---|---|---|
 | AGENT_MITM_PROXY_ALLOWLIST | allowlist.txt | The allowlist (see `allowlist`); missing: allow nothing |
 | AGENT_MITM_PROXY_DENIED_LOG | denied.jsonl | Refused connections, as JSONL |
-| AGENT_MITM_PROXY_TRAFFIC_LOG | decrypted-traffic.jsonl | Decrypted request and response bodies, as JSONL |
+| AGENT_MITM_PROXY_TRAFFIC_LOG | decrypted-traffic.jsonl | Decrypted request and response bodies, as JSONL; a JSON body as JSON, others as text |
 | AGENT_MITM_PROXY_BURST_COUNT | 20 | Refusals of one host:port from one client within BURST_SECONDS that make a burst; 0: off |
 | AGENT_MITM_PROXY_BURST_SECONDS | 5 | The window for BURST_COUNT, at least 1 |
 | AGENT_MITM_PROXY_BURST_RESET | 30 | Seconds (at least 1) a burst's client gets a TCP reset, without an answer, for that host:port |
@@ -25,7 +25,9 @@ client: the allowlist is checked first, so an approved host passes at once. The 
 process (proxy.py runs one per CPU); a looping client exceeds the threshold in each of them.
 
 The traffic log holds whatever the agent sends and receives: treat it as sensitive. Headers are
-never logged, because they carry credentials.
+never logged, because they carry credentials. Nor are the credentials known endpoints carry in
+their JSON bodies, such as the tokens of an OAuth token exchange: `redact` nominates each field,
+and its value is logged as `[REDACTED]`, with the record's `redacted` naming what was replaced.
 """
 
 import base64
@@ -45,6 +47,7 @@ from proxy.http.parser import HttpParser, httpParserTypes
 from proxy.http.proxy import HttpProxyBasePlugin
 
 from .allowlist import AllowlistFile, global_address
+from .redact import redact_body
 
 ALLOWLIST_ENV = "AGENT_MITM_PROXY_ALLOWLIST"
 DENIED_LOG_ENV = "AGENT_MITM_PROXY_DENIED_LOG"
@@ -239,7 +242,8 @@ class TrafficLogPlugin(HttpProxyBasePlugin):
     """Log decrypted requests and responses as JSONL, without modifying them.
 
     Sees plain HTTP only after proxy.py has terminated the client's TLS connection (TLS
-    interception). Request and response headers are deliberately left out.
+    interception). Request and response headers are deliberately left out, and so are the
+    credentials `redact.FIELD_RULES` nominates in bodies.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -296,23 +300,32 @@ class TrafficLogPlugin(HttpProxyBasePlugin):
 
     def on_upstream_connection_close(self) -> None:
         if not self.response_logged and self.response.body:
-            self._write({
-                "direction": "response",
-                "host": self.host,
-                "path": self.request_path,
-                "body": bytes(self.response.body).decode("utf-8", "replace"),
-                "partial": True,
-            })
+            record = {"direction": "response", "host": self.host, "path": self.request_path}
+            _set_body(record, bytes(self.response.body).decode("utf-8", "replace"))
+            record["partial"] = True
+            self._write(record)
 
     @staticmethod
     def _add_body(record: dict[str, Any], body: bytes, encoding: bytes) -> None:
         decoded = _decode(body, encoding)
-        record["body"] = decoded.decode("utf-8", "replace")
+        redacted = _set_body(record, decoded.decode("utf-8", "replace"))
         if encoding:
             record["content_encoding"] = encoding.decode("ascii", "replace")
             record["decoded"] = decoded is not body
-            if decoded is body:  # unknown or broken encoding: keep the exact bytes too
+            # Unknown or broken encoding: the exact bytes too, unless they'd undo the redaction.
+            if decoded is body and not redacted:
                 record["body_base64"] = base64.b64encode(body).decode("ascii")
+
+
+def _set_body(record: dict[str, Any], text: str) -> list[str]:
+    """Put TEXT into RECORD as its body (a JSON object or array as JSON, anything else as text),
+    with what redact.FIELD_RULES nominates for this endpoint replaced, and the list of what was
+    replaced (also returned)."""
+    record["body"], redacted = redact_body(
+        text, host=record["host"], path=record["path"], direction=record["direction"])
+    if redacted:
+        record["redacted"] = redacted
+    return redacted
 
 
 def _content_encoding(message: HttpParser) -> bytes:
