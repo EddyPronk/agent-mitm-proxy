@@ -183,10 +183,11 @@ def test_traffic_log_logs_request_and_response_bodies_but_no_headers(traffic_log
     plugin.on_upstream_connection_close()
 
     req, resp = read_jsonl(traffic_log)
+    # JSON bodies are logged as JSON, for jq: .body.prompt
     assert (req["direction"], req["host"], req["path"], req["method"], req["body"]) == \
-        ("request", "api.example", "/v1/messages", "POST", '{"prompt": "hi"}')
+        ("request", "api.example", "/v1/messages", "POST", {"prompt": "hi"})
     assert (resp["direction"], resp["path"], resp["status"], resp["body"]) == \
-        ("response", "/v1/messages", "200", '{"ok": true}')
+        ("response", "/v1/messages", "200", {"ok": True})
     text = traffic_log.read_text()
     assert "secret" not in text and "s=1" not in text
 
@@ -209,6 +210,56 @@ def test_traffic_log_keeps_undecodable_bodies_as_base64(traffic_log, encoding, b
     [record] = read_jsonl(traffic_log)
     assert record["decoded"] is False
     assert record["body_base64"]
+
+
+def token_exchange(request_body, response):
+    plugin = make(TrafficLogPlugin)
+    plugin.before_upstream_connection(connect("platform.claude.com:443"))
+    plugin.handle_client_request(HttpParser.request(
+        b"POST /v1/oauth/token HTTP/1.1\r\nHost: platform.claude.com\r\nContent-Length: "
+        + str(len(request_body)).encode() + b"\r\n\r\n" + request_body))
+    plugin.handle_upstream_chunk(memoryview(response))
+    plugin.on_upstream_connection_close()
+    return plugin
+
+
+def test_traffic_log_redacts_the_tokens_of_an_oauth_token_exchange(traffic_log):
+    body = b'{"access_token":"sk-ant-oat01-a","expires_in":28800,"refresh_token":"sk-ant-ort01-r"}'
+    token_exchange(b'{"grant_type":"refresh_token","refresh_token":"sk-ant-ort01-old","client_id":"c"}',
+                   b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+    req, resp = read_jsonl(traffic_log)
+    assert req["body"] == {"grant_type": "refresh_token", "refresh_token": "[REDACTED]", "client_id": "c"}
+    assert list(req["body"]) == ["grant_type", "refresh_token", "client_id"]
+    assert req["redacted"] == ["refresh_token"]
+    assert resp["body"] == {"access_token": "[REDACTED]", "expires_in": 28800, "refresh_token": "[REDACTED]"}
+    assert list(resp["body"]) == ["access_token", "expires_in", "refresh_token"]
+    assert resp["redacted"] == ["access_token", "refresh_token"]
+    assert "sk-ant" not in traffic_log.read_text()
+
+
+def test_traffic_log_withholds_an_unfinished_token_response(traffic_log):
+    token_exchange(b'{"grant_type":"refresh_token","refresh_token":"sk-ant-ort01-old"}',
+                   b'HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{"access_token":"sk-ant-oat01-a')
+    _, resp = read_jsonl(traffic_log)
+    assert (resp["redacted"], resp["partial"]) == (["body"], True)
+    assert "sk-ant" not in traffic_log.read_text()
+
+
+@pytest.mark.parametrize(("encoding", "body", "redacted"), [
+    # An encoding it doesn't know, over plain JSON: redacted as text, and no copy of the bytes.
+    (b"zstd", b'{"refresh_token":"sk-ant-ort01-old"}', ["refresh_token"]),
+    # Broken gzip: no JSON to redact, so withheld, and no copy of the bytes either.
+    (b"gzip", gzip.compress(b'{"refresh_token":"sk-ant-ort01-old"}')[:-4], ["body"]),
+])
+def test_traffic_log_keeps_no_base64_copy_of_a_redacted_token_body(traffic_log, encoding, body, redacted):
+    plugin = make(TrafficLogPlugin)
+    plugin.before_upstream_connection(connect("platform.claude.com:443"))
+    plugin.handle_client_request(HttpParser.request(
+        b"POST /v1/oauth/token HTTP/1.1\r\nHost: platform.claude.com\r\nContent-Encoding: " + encoding
+        + b"\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body))
+    [req] = read_jsonl(traffic_log)
+    assert req["redacted"] == redacted and "body_base64" not in req
+    assert "sk-ant" not in traffic_log.read_text()
 
 
 def test_traffic_log_logs_an_unfinished_response_as_partial(traffic_log):
