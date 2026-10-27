@@ -8,7 +8,8 @@ headers and with the credentials and user identity of known endpoints redacted. 
 the agent needs another host, it asks over MCP; the owner approves or rejects on their phone
 (a signed 👍 / 👎 on Buzz), and an approved host is added to the allowlist
 without a restart. Internal services (e.g. Ollama on the LAN) are reachable only per granted
-method + path, without the agent learning their address.
+method + path, without the agent learning their address. Optionally, Claude Code's OAuth tokens
+stay in the proxy and the sandbox holds only placeholders (the credential vault).
 
 ```text
 sandbox ──(internal network, no route out)──▶ proxy ──▶ Internet
@@ -29,6 +30,7 @@ image and setup that ties the pieces together are next.
 | `grants` | Internal services (`services.json`) and their per-path grants | – |
 | `plugins` | proxy.py plugins: `AllowlistPlugin` (refuse unlisted or non-global destinations) and `TrafficLogPlugin` (decrypted bodies as JSONL, never headers, redacted by `redact`) | `scripts/start-proxy.sh` |
 | `redact` | The credentials and identity fields of known endpoints' JSON bodies, and their redaction ([below](#credentials-and-identity-in-the-traffic-log)) | – |
+| `credential_vault` | proxy.py plugin `CredentialVaultPlugin`: Claude Code's OAuth tokens stay in the proxy, the client gets placeholders ([below](#the-credential-vault)); off by default | `AGENT_MITM_PROXY_CREDENTIAL_VAULT=1 scripts/start-proxy.sh` |
 | `gatekeeper`, `mcp_server` | MCP tools `request_allowlist` and `get_request_status`; asks the owner on Buzz | `scripts/start-gatekeeper.sh` |
 | `forwarder` | Forwards granted method + path requests to internal services, streaming | `scripts/start-forwarder.sh` |
 
@@ -143,9 +145,52 @@ and so do ids in request paths, such as `/api/organizations/<uuid>/...`.
 - **A new endpoint with credentials** needs a rule: find where they sit by the shape of the logged
   bodies (key names and types, not values), then add it with a test.
 
+### The credential vault
+
+Claude Code keeps its OAuth tokens in `~/.claude/.credentials.json`, where anything in the sandbox
+can read them: the access token (8 hours) and the refresh token (28 days, renewed on each
+refresh), enough to use the account from anywhere. With `AGENT_MITM_PROXY_CREDENTIAL_VAULT=1`,
+`start-proxy.sh` adds `CredentialVaultPlugin`, and the real tokens never reach the sandbox:
+
+```text
+client (sandbox)                         proxy (vault)                           Anthropic
+POST /v1/oauth/token {code, verifier} ─▶ passes it on ──────────────────────────▶ platform.claude.com
+         {access: P_a, refresh: P_r} ◀─ keeps the real A, R; hands out P_a, P_r ◀─ {access: A, refresh: R}
+Authorization: Bearer P_a ────────────▶ Bearer A ────────────────────────────────▶ api.anthropic.com
+POST /v1/oauth/token {refresh: P_r} ──▶ answered by the vault while A is fresh;
+                                        else one refresh upstream with R ────────▶ platform.claude.com
+```
+
+- **Nothing changes in the client.** Claude Code signs in as usual (`/login`) and stores
+  placeholders (`agent-mitm-proxy-oat-…`, `agent-mitm-proxy-ort-…`), which it doesn't check.
+  A client that signed in before the vault was on is taken over at its next refresh: its real
+  refresh token goes upstream once, and it gets placeholders back.
+- **Real tokens go only to** `api.anthropic.com`, `platform.claude.com` and
+  `mcp-proxy.anthropic.com`, port 443, over the TLS tunnel opened to that host; a request inside
+  it that names another host (absolute URL, Host header) gets no token. A placeholder sent
+  anywhere else goes out unchanged and is logged.
+- **Token responses:** an `id_token` is withheld from the client. One the vault can't read, or
+  one that was cut off, isn't passed on (502), so the client never gets real tokens by accident.
+- **Refreshes:** the vault answers them itself until the real access token is within 5 minutes
+  of expiring (or got a 401), then sends one upstream. Anthropic revokes the previous access token
+  on every refresh, so needless refreshes make requests on their way fail.
+- **What it doesn't stop:** the sandbox can still *use* the account through this proxy, as before;
+  it just can't take a credential with it. Placeholders are random (192 bits) but not tied to a
+  client: anyone who can reach the proxy and knows one can use it.
+- **Forgetting:** a new sign-in for an account replaces that account's earlier entries from the
+  same client address; entries whose refresh token has expired are dropped. Dropped entries are
+  forgotten, not revoked upstream.
+- **Files** (in the data directory, private): `credential-vault.json` (the real tokens, mode
+  0600, refused if group or others can read it; written atomically) and `vault.jsonl` (what the
+  vault did: sign-ins, refreshes, swaps, placeholders sent elsewhere; never token values).
+- **It follows Claude Code's sign-in, which Anthropic doesn't document.** If that changes (another
+  host, another field), the symptom is a 401 in Claude Code and a `placeholder-elsewhere` or
+  `unknown-placeholder` record in `vault.jsonl`; turn the vault off and sign in again meanwhile.
+
 ### What to keep private
 
-The data directory holds the CA private keys and the decrypted traffic; `services.json` holds
+The data directory holds the CA private keys, the decrypted traffic and, with the credential
+vault on, Claude Code's tokens; `services.json` holds
 internal addresses; the gatekeeper's key file is its Buzz identity. Only the CA certificate
 (`AGENT_MITM_PROXY_CA_PUBLISH`) is meant for clients. `.gitignore` covers these names in this
 folder.
