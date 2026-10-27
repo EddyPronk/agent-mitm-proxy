@@ -13,6 +13,9 @@
 #                                [/etc/ssl/certs/ca-certificates.crt]
 #   AGENT_MITM_PROXY_ALLOWLIST   the allowlist [./allowlist.txt]
 #   AGENT_MITM_PROXY_DENIED_LOG, AGENT_MITM_PROXY_TRAFFIC_LOG  [in the data directory]
+#   AGENT_MITM_PROXY_CREDENTIAL_VAULT  1: keep Claude Code's OAuth tokens in the proxy and give
+#                                the client placeholders (credential_vault) [off]
+#   AGENT_MITM_PROXY_VAULT, AGENT_MITM_PROXY_VAULT_LOG  [in the data directory]
 set -Eeuo pipefail
 umask 077
 
@@ -24,6 +27,17 @@ CA_BUNDLE="${AGENT_MITM_PROXY_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}"
 export AGENT_MITM_PROXY_ALLOWLIST="$(realpath -m -- "${AGENT_MITM_PROXY_ALLOWLIST:-allowlist.txt}")"
 export AGENT_MITM_PROXY_DENIED_LOG="${AGENT_MITM_PROXY_DENIED_LOG:-${DATA_DIR}/denied.jsonl}"
 export AGENT_MITM_PROXY_TRAFFIC_LOG="${AGENT_MITM_PROXY_TRAFFIC_LOG:-${DATA_DIR}/decrypted-traffic.jsonl}"
+export AGENT_MITM_PROXY_VAULT="${AGENT_MITM_PROXY_VAULT:-${DATA_DIR}/credential-vault.json}"
+export AGENT_MITM_PROXY_VAULT_LOG="${AGENT_MITM_PROXY_VAULT_LOG:-${DATA_DIR}/vault.jsonl}"
+
+# Plugin order matters: the allowlist refuses before anything is logged, and the vault comes after
+# the traffic log (which then sees what the client sent, and what came back before the vault).
+PLUGINS=agent_mitm_proxy.plugins.AllowlistPlugin,agent_mitm_proxy.plugins.TrafficLogPlugin
+case "${AGENT_MITM_PROXY_CREDENTIAL_VAULT:-}" in
+  1) PLUGINS+=,agent_mitm_proxy.credential_vault.CredentialVaultPlugin ;;
+  ''|0) ;;
+  *) echo "AGENT_MITM_PROXY_CREDENTIAL_VAULT must be 1 or 0, not '${AGENT_MITM_PROXY_CREDENTIAL_VAULT}'" >&2; exit 1 ;;
+esac
 
 CA_KEY="${DATA_DIR}/ca-key.pem"
 CA_CERT="${DATA_DIR}/ca-cert.pem"
@@ -66,7 +80,6 @@ if listening; then
 fi
 
 # setsid + nohup: keep running after a lifecycle command returns.
-# Plugin order matters: the allowlist refuses before anything is logged.
 setsid nohup "${PYTHON}" -m proxy \
     --hostname 0.0.0.0 \
     --port "${PORT}" \
@@ -75,7 +88,7 @@ setsid nohup "${PYTHON}" -m proxy \
     --ca-signing-key-file "${CA_SIGNING_KEY}" \
     --ca-cert-dir "${DATA_DIR}/certs" \
     --ca-file "${CA_BUNDLE}" \
-    --plugins agent_mitm_proxy.plugins.AllowlistPlugin,agent_mitm_proxy.plugins.TrafficLogPlugin \
+    --plugins "${PLUGINS}" \
     >>"${PROXY_LOG}" 2>&1 </dev/null &
 
 for _ in {1..50}; do

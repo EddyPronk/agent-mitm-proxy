@@ -18,6 +18,8 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from .oauth import REVOKE_PATH, TOKEN_FIELDS, TOKEN_HOST, TOKEN_PATH, TOKEN_REQUEST_FIELDS
+
 REDACTED = "[REDACTED]"
 WITHHELD = "[WITHHELD: not valid JSON, so its credentials couldn't be redacted]"
 
@@ -48,21 +50,17 @@ class FieldRule:
 # Credentials first, then the user's identity: account and organisation ids, email address, name.
 # Ids that don't point to a person stay: messages', MCP servers', the Claude Code application's.
 FIELD_RULES = (
-    # OAuth sign-in and refresh: the authorization code and its PKCE verifier, or the refresh
-    # token being spent; state ties a sign-in to its browser session.
-    FieldRule("/v1/oauth/token", "request",
-              (("code",), ("code_verifier",), ("refresh_token",), ("state",)),
-              host="platform.claude.com"),
+    # OAuth sign-in and refresh: the credentials in the request (see `oauth`) ...
+    FieldRule(TOKEN_PATH, "request", tuple((f,) for f in TOKEN_REQUEST_FIELDS), host=TOKEN_HOST),
     # ... and the tokens it hands out, with whose they are. The organisation's default name holds
     # the email address ("...'s Organization").
-    FieldRule("/v1/oauth/token", "response",
-              (("access_token",), ("refresh_token",), ("id_token",), ("token_uuid",),
+    FieldRule(TOKEN_PATH, "response",
+              tuple((f,) for f in TOKEN_FIELDS) + (("token_uuid",),
                ("organization", "uuid"), ("organization", "name"),
                ("account", "uuid"), ("account", "email_address")),
-              host="platform.claude.com"),
+              host=TOKEN_HOST),
     # Signing out: the token being revoked.
-    FieldRule("/v1/oauth/token/revoke", "request", (("token",),),
-              host="platform.claude.com"),
+    FieldRule(REVOKE_PATH, "request", (("token",),), host=TOKEN_HOST),
     # Remote Control: the session worker's JWT.
     FieldRule("/v1/code/sessions/*/bridge", "response", (("worker_jwt",),),
               host="api.anthropic.com"),
