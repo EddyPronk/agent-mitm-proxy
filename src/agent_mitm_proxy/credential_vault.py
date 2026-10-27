@@ -41,6 +41,15 @@ that account from the same client address: they're dropped from the vault, not r
 Entries whose refresh token has expired are dropped too. (A container that gets another's old
 address and signs in to the same account makes the other sign in again.)
 
+**Clients** (with proxy authentication, `client_auth`). Every connection then has an enrolled
+client's name, and an entry belongs to a list of clients: the one that signed in, plus those
+granted it on the proxy (`vault grant NAME`; `vault enroll` grants the newest entry). A placeholder
+is swapped only for those clients; for any other it goes out unchanged and is logged as
+`not-this-clients-entry`. An entry from before authentication has no client list, and is claimed by
+the first client that uses its placeholder (`claimed`); one whose last client was removed (an
+empty list) is refused to everyone until it's granted again. Without proxy authentication, clients
+aren't told apart.
+
 proxy.py runs one process per CPU, so the vault isn't held in memory: every lookup and update
 reads the file under an flock (on a lock file next to it). Updates are written to a temporary
 file and renamed over the vault, so it's never half-written; a vault that group or others can
@@ -72,6 +81,7 @@ from proxy.common.utils import build_http_response
 from proxy.http.parser import HttpParser, httpParserTypes
 from proxy.http.proxy import HttpProxyBasePlugin
 
+from .client_auth import client_of
 from .oauth import REVOKE_PATH, TOKEN_FIELDS, TOKEN_HOST, TOKEN_PATH
 from .plugins import _decode, _now
 
@@ -194,11 +204,12 @@ class Vault:
         return None
 
     def store(self, tokens: dict[str, Any], entry_id: str | None,
-              client: str | None = None) -> tuple[str, dict[str, Any]]:
+              client: str | None = None, name: str | None = None) -> tuple[str, dict[str, Any]]:
         """Keep a token response's real tokens: in ENTRY_ID's entry (refresh; an absent refresh
         token keeps the old one), or in a new one (sign-in, adoption), which replaces the
-        account's earlier entries from the same CLIENT address. The response's other fields are
-        kept too, with each "…expires_in" as an absolute time. Returns the entry."""
+        account's earlier entries from the same CLIENT (an address, or an enrolled NAME). A new
+        entry made by an enrolled client belongs to it (its "clients"). The response's other
+        fields are kept too, with each "…expires_in" as an absolute time. Returns the entry."""
         now = time.time()
         self.forgotten = []
         with self._open(write=True) as data:
@@ -212,6 +223,8 @@ class Vault:
                 entry_id = secrets.token_hex(4)
                 data["entries"][entry_id] = {"created": _now(), "client": client, "account": account,
                                              "placeholder_access": placeholder("access")}
+                if name is not None:
+                    data["entries"][entry_id]["clients"] = [name]
             e = data["entries"][entry_id]
             e["access_token"] = tokens["access_token"]
             if tokens.get("refresh_token"):
@@ -271,6 +284,53 @@ class Vault:
     def remove(self, entry_id: str) -> None:
         with self._open(write=True) as data:
             data["entries"].pop(entry_id, None)
+
+    def entries(self) -> dict[str, dict[str, Any]]:
+        with self._open(write=False) as data:
+            return {i: dict(e) for i, e in data["entries"].items()}
+
+    def claim(self, entry_id: str, name: str) -> dict[str, Any] | None:
+        """ENTRY_ID was made before proxy authentication (it has no client list at all): it now
+        belongs to NAME. None if it's gone, or has a client list, even an empty one: an entry
+        whose last client was removed stays refused until it's granted again."""
+        with self._open(write=True) as data:
+            e = data["entries"].get(entry_id)
+            if e is None or "clients" in e:
+                return None
+            e["clients"] = [name]
+            return dict(e)
+
+    def grant(self, name: str, entry_id: str | None = None) -> str | None:
+        """Let NAME use ENTRY_ID (default: the newest entry). Returns the entry's id, or None."""
+        with self._open(write=True) as data:
+            entries = data["entries"]
+            if entry_id is None:
+                entry_id = max(entries, key=lambda i: entries[i].get("refreshed_at", 0), default=None)
+            if entry_id is None or entry_id not in entries:
+                return None
+            names = entries[entry_id].setdefault("clients", [])
+            if name not in names:
+                names.append(name)
+            return entry_id
+
+    def ungrant(self, name: str) -> list[str]:
+        """NAME no longer uses any entry. Returns the ids of the entries it was in."""
+        with self._open(write=True) as data:
+            changed = []
+            for entry_id, e in data["entries"].items():
+                if name in e.get("clients", []):
+                    e["clients"].remove(name)
+                    changed.append(entry_id)
+            return changed
+
+    def newest_for(self, name: str | None) -> tuple[str, dict[str, Any]] | None:
+        """The newest complete entry (placeholders for both tokens) NAME belongs to; without a
+        NAME (no proxy authentication), the newest of all."""
+        with self._open(write=False) as data:
+            usable = [(i, dict(e)) for i, e in data["entries"].items()
+                      if e.get("placeholder_refresh") and e.get("expires_at")
+                      and (name is None or name in e.get("clients", []))]
+        return max(usable, key=lambda ie: ie[1].get("refreshed_at", 0), default=None)
 
 
 def answer_body(e: dict[str, Any]) -> dict[str, Any]:
@@ -378,14 +438,36 @@ class CredentialVaultPlugin(HttpProxyBasePlugin):
             token = value.removeprefix(scheme)
             if not is_placeholder(token):
                 continue
-            found = self.vault.find(token)
+            found = self._find(token, name.decode())
             if found is None:
-                self._log("unknown-placeholder", where=name.decode())
                 continue
             entry_id, e = found
             request.add_header(name.title(), (scheme + e["access_token"]).encode("latin-1"))
             self.swapped = (entry_id, e.get("generation", 0))
             self._log("swap", where=name.decode(), entry=entry_id, generation=self.swapped[1])
+
+    def _find(self, token: str, where: str) -> tuple[str, dict[str, Any]] | None:
+        """The entry of placeholder TOKEN, if this client may use it. With proxy authentication
+        (client_auth), an entry is used only by the clients in its list; one without a list (made
+        before authentication) is claimed by the first client that uses it. An empty list (its
+        last client removed) refuses everyone until `vault grant`."""
+        found = self.vault.find(token)
+        if found is None:
+            self._log("unknown-placeholder", where=where)
+            return None
+        name = client_of(self)
+        if name is None:
+            return found
+        entry_id, e = found
+        if name in e.get("clients", []):
+            return found
+        if "clients" not in e:
+            claimed = self.vault.claim(entry_id, name)
+            if claimed is not None:
+                self._log("claimed", entry=entry_id, client=name)
+                return entry_id, claimed
+        self._log("not-this-clients-entry", where=where, entry=entry_id, client=name)
+        return None
 
     def _note_elsewhere(self, request: HttpParser, reason: str) -> None:
         """A placeholder in a header of a request the vault doesn't serve: not swapped, but logged,
@@ -417,9 +499,8 @@ class CredentialVaultPlugin(HttpProxyBasePlugin):
             request.add_header(b"Accept-Encoding", b"identity")
         if not isinstance(token, str) or not is_placeholder(token):
             return request
-        found = self.vault.find(token)
+        found = self._find(token, field)
         if found is None:
-            self._log("unknown-placeholder", where=field)
             return request
         entry_id, e = found
         if refreshing:
@@ -533,7 +614,8 @@ class CredentialVaultPlugin(HttpProxyBasePlugin):
             self._log("token-response-passed", status=status, entry=entry_id)
             return r.build_response()
         event = "refresh" if entry_id else "adopt" if self.adopting else "sign-in"
-        entry_id, e = self.vault.store(body, entry_id, client=self._client_ip())
+        name = client_of(self)
+        entry_id, e = self.vault.store(body, entry_id, client=name or self._client_ip(), name=name)
         self._log_forgotten()
         body["access_token"] = e["placeholder_access"]
         if body.get("refresh_token"):
