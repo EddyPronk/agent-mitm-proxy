@@ -11,6 +11,7 @@ import pytest
 from proxy.http.parser import HttpParser, httpParserTypes
 
 from agent_mitm_proxy import credential_vault
+from agent_mitm_proxy.client_auth import NAME_ATTR
 from agent_mitm_proxy.credential_vault import CredentialVaultPlugin, Vault
 
 REAL = {"access_token": "sk-ant-oat01-REAL-ACCESS-1", "refresh_token": "sk-ant-ort01-REAL-REFRESH-1",
@@ -46,8 +47,12 @@ def events(tmp_path) -> list[str]:
     return [r["event"] for r in log(tmp_path)]
 
 
-def connection(host: str, ip: str = "10.0.0.2") -> CredentialVaultPlugin:
-    plugin = CredentialVaultPlugin("uid", argparse.Namespace(), FakeClient(ip), None)
+def connection(host: str, ip: str = "10.0.0.2", name: str | None = None) -> CredentialVaultPlugin:
+    """A CONNECT to HOST; with NAME, from a client that authenticated as NAME (client_auth)."""
+    client = FakeClient(ip)
+    if name is not None:
+        setattr(client, NAME_ATTR, name)
+    plugin = CredentialVaultPlugin("uid", argparse.Namespace(), client, None)
     connect = HttpParser(httpParserTypes.REQUEST_PARSER)
     connect.parse(memoryview(f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n".encode()))
     plugin.before_upstream_connection(connect)
@@ -103,9 +108,9 @@ def body_of(raw: bytes) -> dict:
     return json.loads(parsed.body)
 
 
-def sign_in(ip="10.0.0.2", tokens=REAL):
+def sign_in(ip="10.0.0.2", tokens=REAL, name=None):
     """A sign-in through the vault; the placeholders the client gets."""
-    p = connection("platform.claude.com", ip)
+    p = connection("platform.claude.com", ip, name)
     token_request(p, grant_type="authorization_code", code="c", code_verifier="v")
     _, client = receive(p, response("200 OK", tokens))
     got = body_of(client)
@@ -506,3 +511,74 @@ def test_traffic_log_and_vault_together(vault, tmp_path, monkeypatch):
 def test_hosts():
     assert "example.com" not in credential_vault.VAULT_HOSTS
     assert credential_vault.TOKEN_HOST in credential_vault.VAULT_HOSTS
+
+
+# -- clients (proxy authentication) ------------------------------------------
+
+def test_sign_in_by_an_enrolled_client_belongs_to_it(vault, tmp_path):
+    access, _ = sign_in(name="alpha")
+    _, e = vault.find(access)
+    assert e["clients"] == ["alpha"] and e["client"] == "alpha"
+    up = send(connection("api.anthropic.com", name="alpha"), "GET", "/", {"Authorization": f"Bearer {access}"})
+    assert b"REAL-ACCESS-1" in up
+
+
+def test_an_entry_is_swapped_only_for_its_clients(vault, tmp_path):
+    access, refresh_ph = sign_in(name="alpha")
+    up = send(connection("api.anthropic.com", name="beta"), "GET", "/", {"Authorization": f"Bearer {access}"})
+    assert b"REAL" not in up and access.encode() in up
+    assert refresh(connection("platform.claude.com", name="beta"), refresh_ph) is not None
+    assert events(tmp_path)[-2:] == ["not-this-clients-entry"] * 2
+    assert all(r.get("client") == "beta" for r in log(tmp_path)[-2:])
+
+
+def test_a_granted_client_gets_the_entry(vault):
+    access, _ = sign_in(name="alpha")
+    entry_id, _ = vault.find(access)
+    assert vault.grant("beta") == entry_id and vault.grant("beta") == entry_id
+    assert vault.find(access)[1]["clients"] == ["alpha", "beta"]
+    up = send(connection("api.anthropic.com", name="beta"), "GET", "/", {"Authorization": f"Bearer {access}"})
+    assert b"REAL-ACCESS-1" in up
+    assert vault.ungrant("beta") == [entry_id] and vault.find(access)[1]["clients"] == ["alpha"]
+
+
+def test_an_entry_from_before_authentication_is_claimed_by_its_first_user(vault, tmp_path):
+    access, _ = sign_in()                                   # no name: belongs to no one
+    entry_id, e = vault.find(access)
+    assert not e.get("clients")
+    up = send(connection("api.anthropic.com", name="alpha"), "GET", "/", {"Authorization": f"Bearer {access}"})
+    assert b"REAL-ACCESS-1" in up
+    assert vault.find(access)[1]["clients"] == ["alpha"]
+    assert log(tmp_path)[-2]["event"] == "claimed" and log(tmp_path)[-2]["entry"] == entry_id
+    up = send(connection("api.anthropic.com", name="beta"), "GET", "/", {"Authorization": f"Bearer {access}"})
+    assert b"REAL" not in up
+
+
+def test_an_entry_whose_last_client_was_removed_stays_refused(vault, tmp_path):
+    access, _ = sign_in(name="alpha")
+    entry_id, _ = vault.find(access)
+    open_connection = connection("api.anthropic.com", name="alpha")
+    assert vault.ungrant("alpha") == [entry_id]
+    assert vault.entries()[entry_id]["clients"] == []
+    for client in (open_connection, connection("api.anthropic.com", name="beta")):
+        up = send(client, "GET", "/", {"Authorization": f"Bearer {access}"})
+        assert b"REAL" not in up
+    assert vault.entries()[entry_id]["clients"] == []
+    assert vault.claim(entry_id, "beta") is None
+    assert "claimed" not in events(tmp_path)
+    vault.grant("beta", entry_id)
+    up = send(connection("api.anthropic.com", name="beta"), "GET", "/", {"Authorization": f"Bearer {access}"})
+    assert b"REAL-ACCESS-1" in up
+
+
+def test_without_authentication_clients_are_not_told_apart(vault):
+    access, _ = sign_in(name="alpha")
+    up = send(connection("api.anthropic.com"), "GET", "/", {"Authorization": f"Bearer {access}"})
+    assert b"REAL-ACCESS-1" in up
+
+
+def test_grant_without_entries_and_newest_for(vault):
+    assert vault.grant("alpha") is None and vault.newest_for("alpha") is None
+    sign_in(name="alpha")
+    entry_id, _ = vault.newest_for("alpha")
+    assert vault.newest_for(None)[0] == entry_id and vault.newest_for("beta") is None

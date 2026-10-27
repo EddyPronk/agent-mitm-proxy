@@ -31,6 +31,7 @@ image and setup that ties the pieces together are next.
 | `plugins` | proxy.py plugins: `AllowlistPlugin` (refuse unlisted or non-global destinations) and `TrafficLogPlugin` (decrypted bodies as JSONL, never headers, redacted by `redact`) | `scripts/start-proxy.sh` |
 | `redact` | The credentials and identity fields of known endpoints' JSON bodies, and their redaction ([below](#credentials-and-identity-in-the-traffic-log)) | – |
 | `credential_vault` | proxy.py plugin `CredentialVaultPlugin`: Claude Code's OAuth tokens stay in the proxy, the client gets placeholders ([below](#the-credential-vault)); off by default | `AGENT_MITM_PROXY_CREDENTIAL_VAULT=1 scripts/start-proxy.sh` |
+| `credential_delivery`, `client_auth`, `vault_cli` | Hands a sandbox its credentials file (placeholders) from the vault; a name and token per client in the proxy URL; the `vault` command to enrol clients and grant them entries ([below](#giving-a-new-sandbox-the-sign-in)); `credential_delivery` is on with the vault, `client_auth` off by default | `AGENT_MITM_PROXY_CLIENT_AUTH=1`, `vault enroll NAME` |
 | `gatekeeper`, `mcp_server` | MCP tools `request_allowlist` and `get_request_status`; asks the owner on Buzz | `scripts/start-gatekeeper.sh` |
 | `forwarder` | Forwards granted method + path requests to internal services, streaming | `scripts/start-forwarder.sh` |
 
@@ -176,7 +177,8 @@ POST /v1/oauth/token {refresh: P_r} ──▶ answered by the vault while A is f
   on every refresh, so needless refreshes make requests on their way fail.
 - **What it doesn't stop:** the sandbox can still *use* the account through this proxy, as before;
   it just can't take a credential with it. Placeholders are random (192 bits) but not tied to a
-  client: anyone who can reach the proxy and knows one can use it.
+  client unless you turn on client authentication ([below](#giving-a-new-sandbox-the-sign-in)):
+  anyone who can reach the proxy and knows one can use it.
 - **Forgetting:** a new sign-in for an account replaces that account's earlier entries from the
   same client address; entries whose refresh token has expired are dropped. Dropped entries are
   forgotten, not revoked upstream.
@@ -186,6 +188,43 @@ POST /v1/oauth/token {refresh: P_r} ──▶ answered by the vault while A is f
 - **It follows Claude Code's sign-in, which Anthropic doesn't document.** If that changes (another
   host, another field), the symptom is a 401 in Claude Code and a `placeholder-elsewhere` or
   `unknown-placeholder` record in `vault.jsonl`; turn the vault off and sign in again meanwhile.
+
+#### Giving a new sandbox the sign-in
+
+A client that never signed in can get the placeholders from the proxy. With the vault on, the
+proxy answers `GET http://agent-mitm-proxy.internal/v1/credentials/claude` itself (plain HTTP
+through the proxy; it never goes upstream) with the JSON of a `~/.claude/.credentials.json`
+holding the placeholders of the newest entry, or 404 if there is none. The client writes the
+response to its `~/.claude/.credentials.json` (mode 0600) and Claude Code starts without a
+sign-in (it asks again unless `hasCompletedOnboarding` is set in `~/.claude.json`). The response
+holds no real token. Every answer is logged in `vault.jsonl`.
+
+As it stands, any sandbox on the proxy's network can fetch it, which suits one person and one
+account. To tell sandboxes apart, turn on **client authentication**:
+
+```sh
+AGENT_MITM_PROXY_CLIENT_AUTH=1 AGENT_MITM_PROXY_CREDENTIAL_VAULT=1 scripts/start-proxy.sh
+vault enroll alpha        # prints http://alpha:TOKEN@proxy:8899, once
+```
+
+- **Every connection** then needs a name and token, in the client's proxy URL
+  (`HTTPS_PROXY=http://alpha:TOKEN@proxy:8899`; Claude Code and curl accept it), or it gets 407.
+  Enrolling a name again gives a new token and ends the old one; `vault unenroll NAME` ends it
+  too. Both apply to open connections at their next request. The proxy keeps only hashes, in
+  `clients.json` (mode 0600, changed under a lock), and never passes `Proxy-Authorization` on.
+  Refusals are logged in `clients.jsonl`.
+- **An entry belongs to clients:** the one that signed in, plus those given it with
+  `vault grant NAME` (`vault enroll` grants the newest entry, `--no-grant` doesn't). A
+  placeholder is swapped, and the entry delivered, only for those. For another client the
+  placeholder goes out unchanged, and `not-this-clients-entry` is logged. An entry made before
+  authentication belongs to no one yet, is never delivered, and is claimed by the first client that
+  uses its placeholder. An entry whose last client was unenrolled is refused to every client until
+  `vault grant`.
+- **What it doesn't stop:** a sandbox that holds its token can still use the account, as before,
+  and its token is in its environment. It keeps *other* sandboxes, and anything else that can
+  reach the proxy, from using it.
+- `vault clients|entries|remove|unenroll` list and change what the proxy holds (`entries` shows no
+  tokens).
 
 ### What to keep private
 

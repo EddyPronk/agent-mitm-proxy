@@ -16,6 +16,11 @@
 #   AGENT_MITM_PROXY_CREDENTIAL_VAULT  1: keep Claude Code's OAuth tokens in the proxy and give
 #                                the client placeholders (credential_vault) [off]
 #   AGENT_MITM_PROXY_VAULT, AGENT_MITM_PROXY_VAULT_LOG  [in the data directory]
+#                                With the vault, the proxy also delivers a client's credentials
+#                                file (placeholders) at http://agent-mitm-proxy.internal/v1/credentials/claude
+#   AGENT_MITM_PROXY_CLIENT_AUTH 1: every client must authenticate with a name and token of its
+#                                own (`vault enroll NAME`), in its proxy URL (client_auth) [off]
+#   AGENT_MITM_PROXY_CLIENTS, AGENT_MITM_PROXY_CLIENTS_LOG  [in the data directory]
 set -Eeuo pipefail
 umask 077
 
@@ -29,14 +34,24 @@ export AGENT_MITM_PROXY_DENIED_LOG="${AGENT_MITM_PROXY_DENIED_LOG:-${DATA_DIR}/d
 export AGENT_MITM_PROXY_TRAFFIC_LOG="${AGENT_MITM_PROXY_TRAFFIC_LOG:-${DATA_DIR}/decrypted-traffic.jsonl}"
 export AGENT_MITM_PROXY_VAULT="${AGENT_MITM_PROXY_VAULT:-${DATA_DIR}/credential-vault.json}"
 export AGENT_MITM_PROXY_VAULT_LOG="${AGENT_MITM_PROXY_VAULT_LOG:-${DATA_DIR}/vault.jsonl}"
+export AGENT_MITM_PROXY_CLIENTS="${AGENT_MITM_PROXY_CLIENTS:-${DATA_DIR}/clients.json}"
+export AGENT_MITM_PROXY_CLIENTS_LOG="${AGENT_MITM_PROXY_CLIENTS_LOG:-${DATA_DIR}/clients.jsonl}"
 
 # Plugin order matters: the allowlist refuses before anything is logged, and the vault comes after
-# the traffic log (which then sees what the client sent, and what came back before the vault).
+# the traffic log (which then sees what the client sent, and what came back before the vault). The
+# credentials delivery comes first: its host is made up, and the allowlist would refuse it. proxy.py
+# runs an --auth-plugin before all of them.
 PLUGINS=agent_mitm_proxy.plugins.AllowlistPlugin,agent_mitm_proxy.plugins.TrafficLogPlugin
 case "${AGENT_MITM_PROXY_CREDENTIAL_VAULT:-}" in
-  1) PLUGINS+=,agent_mitm_proxy.credential_vault.CredentialVaultPlugin ;;
+  1) PLUGINS=agent_mitm_proxy.credential_delivery.CredentialDeliveryPlugin,${PLUGINS},agent_mitm_proxy.credential_vault.CredentialVaultPlugin ;;
   ''|0) ;;
   *) echo "AGENT_MITM_PROXY_CREDENTIAL_VAULT must be 1 or 0, not '${AGENT_MITM_PROXY_CREDENTIAL_VAULT}'" >&2; exit 1 ;;
+esac
+AUTH=()
+case "${AGENT_MITM_PROXY_CLIENT_AUTH:-}" in
+  1) AUTH=(--auth-plugin agent_mitm_proxy.client_auth.ClientAuthPlugin) ;;
+  ''|0) ;;
+  *) echo "AGENT_MITM_PROXY_CLIENT_AUTH must be 1 or 0, not '${AGENT_MITM_PROXY_CLIENT_AUTH}'" >&2; exit 1 ;;
 esac
 
 CA_KEY="${DATA_DIR}/ca-key.pem"
@@ -89,6 +104,7 @@ setsid nohup "${PYTHON}" -m proxy \
     --ca-cert-dir "${DATA_DIR}/certs" \
     --ca-file "${CA_BUNDLE}" \
     --plugins "${PLUGINS}" \
+    "${AUTH[@]}" \
     >>"${PROXY_LOG}" 2>&1 </dev/null &
 
 for _ in {1..50}; do
