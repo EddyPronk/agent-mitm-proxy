@@ -1,10 +1,11 @@
 """The MCP tools, called in-process on a gatekeeper without a relay (see fakes.py)."""
 
+import asyncio
 import json
 
 from fakes import connected, reaction
 
-from agent_mitm_proxy.mcp_server import build_server
+from agent_mitm_proxy.mcp_server import build_server, serve
 
 
 async def call(server, tool, **arguments):
@@ -51,3 +52,21 @@ async def test_service_requests_go_through_the_tool(cfg):
                         method="POST", path="/api/chat")
     assert (result["service"], result["method"], result["path"], result["status"]) == \
         ("ollama", "POST", "/api/chat", "pending")
+
+
+async def test_the_relay_loop_stops_when_the_http_server_does():
+    # uvicorn returns on SIGTERM; the relay loop must not keep the process alive.
+    cancelled = asyncio.Event()
+
+    async def relay():
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    async def http():
+        await asyncio.sleep(0)
+
+    await asyncio.wait_for(serve(relay(), http()), timeout=5)
+    assert cancelled.is_set()

@@ -16,6 +16,7 @@ Besides the gatekeeper's variables:
 """
 
 import asyncio
+import contextlib
 import os
 
 from mcp.server.mcpserver import MCPServer
@@ -78,13 +79,23 @@ async def main() -> None:
         allowed_hosts=[f"{name.strip()}:{port}" for name in hostnames if name.strip()],
         allowed_origins=[],
     )
-    await asyncio.gather(
-        gatekeeper.run(),
-        server.run_streamable_http_async(
-            host="0.0.0.0", port=port, json_response=True, stateless_http=True,
-            transport_security=security,
-        ),
-    )
+    await serve(gatekeeper.run(), server.run_streamable_http_async(
+        host="0.0.0.0", port=port, json_response=True, stateless_http=True,
+        transport_security=security,
+    ))
+
+
+async def serve(relay, http) -> None:
+    """Run the gatekeeper's RELAY loop for as long as the HTTP server runs. uvicorn handles SIGTERM
+    by returning; the relay loop never ends on its own, so without stopping it here the process would
+    stay connected to Buzz, without its port."""
+    task = asyncio.create_task(relay)
+    try:
+        await http
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 if __name__ == "__main__":
