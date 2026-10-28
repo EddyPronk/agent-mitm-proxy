@@ -1,6 +1,6 @@
 [project]
 name = "agent-mitm-proxy"
-version = "1.4.0"
+version = "1.5.0"
 description = "A TLS-intercepting egress proxy with an allowlist, for sandboxed coding agents"
 readme = "README.md"
 license = "Apache-2.0"
@@ -19,6 +19,7 @@ dependencies = [
 [project.scripts]
 approve = "agent_mitm_proxy.approve:main"
 vault = "agent_mitm_proxy.vault_cli:main"
+gatekeeper = "agent_mitm_proxy.gatekeeper_cli:main"
 
 [dependency-groups]
 dev = [

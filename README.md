@@ -32,7 +32,7 @@ image and setup that ties the pieces together are next.
 | `redact` | The credentials and identity fields of known endpoints' JSON bodies, and their redaction ([below](#credentials-and-identity-in-the-traffic-log)) | – |
 | `credential_vault` | proxy.py plugin `CredentialVaultPlugin`: Claude Code's OAuth tokens stay in the proxy, the client gets placeholders ([below](#the-credential-vault)); off by default | `AGENT_MITM_PROXY_CREDENTIAL_VAULT=1 scripts/start-proxy.sh` |
 | `credential_delivery`, `client_auth`, `vault_cli` | Hands a sandbox its credentials file (placeholders) from the vault; a name and token per client in the proxy URL; the `vault` command to enrol clients and grant them entries ([below](#giving-a-new-sandbox-the-sign-in)); `credential_delivery` is on with the vault, `client_auth` off by default | `AGENT_MITM_PROXY_CLIENT_AUTH=1`, `vault enroll NAME` |
-| `gatekeeper`, `mcp_server` | MCP tools `request_allowlist` and `get_request_status`; asks the owner on Buzz | `scripts/start-gatekeeper.sh` |
+| `gatekeeper`, `mcp_server`, `gatekeeper_cli` | MCP tools `request_allowlist` and `get_request_status`; asks the owner on Buzz; the `gatekeeper` command sets up its identity ([below](#approving-from-your-phone-the-gatekeeper)) | `gatekeeper init`, `scripts/start-gatekeeper.sh` |
 | `forwarder` | Forwards granted method + path requests to internal services, streaming | `scripts/start-forwarder.sh` |
 
 Each module's docstring lists its environment variables; each script's header lists its own.
@@ -108,6 +108,33 @@ Added 1 to /workspace/allowlist.txt; the proxy applies it without a restart.
   `AGENT_MITM_PROXY_DENIED_LOG`, `AGENT_MITM_PROXY_ALLOWLIST`), or `--denied-log` and `--allowlist`.
 
 Editing the allowlist by hand works just as well.
+
+### Approving from your phone: the gatekeeper
+
+The gatekeeper lets the agent ask while it works: it calls `request_allowlist` (MCP, on port 8900),
+you get a Buzz DM, and your 👍 adds the host. It acts as an identity of its own on your Buzz
+relay: a key that you attest with yours (NIP-OA), so the relay admits it as your agent. The
+`gatekeeper` command sets that identity up, on the proxy, in `$AGENT_MITM_PROXY_DATA/gatekeeper`
+(private):
+
+```sh
+gatekeeper init --relay wss://NAME.communities.buzz.xyz   # a new key; prints its npub
+# on your own machine, with your key: an attestation of that npub (NIP-OA, e.g. 90 days)
+gatekeeper attest < auth-tag.json                         # checked against the key
+gatekeeper dm DM_ID                                       # your DM with the gatekeeper's npub
+gatekeeper status                                         # set up? running? attestation expiry?
+```
+
+- **The key never leaves the proxy:** `init` makes it there and prints only the npub. To keep an
+  identity you already have, `gatekeeper import-key --relay URL < key-file` takes its nsec instead.
+- **`attest`** refuses a tag for another key, or one that has expired, and takes your pubkey from
+  it: only your signed reactions decide, so a stolen gatekeeper key can send DMs as the gatekeeper
+  but can't approve anything. `status` warns two weeks before the attestation expires; attest again
+  then.
+- **The DM** is opened from the Buzz app or the Buzz CLI (`buzz dms open`) for now: buzzkit can't
+  open one.
+- **`scripts/start-gatekeeper.sh`** starts it from this set-up, and does nothing on a proxy without
+  one, so it can run on every start, after `start-proxy.sh`.
 
 ### Credentials and identity in the traffic log
 
@@ -230,7 +257,8 @@ vault enroll alpha        # prints http://alpha:TOKEN@proxy:8899, once
 
 The data directory holds the CA private keys, the decrypted traffic and, with the credential
 vault on, Claude Code's tokens; `services.json` holds
-internal addresses; the gatekeeper's key file is its Buzz identity. Only the CA certificate
+internal addresses; the gatekeeper's key (in the data directory's `gatekeeper/`, or
+`GATEKEEPER_KEY_FILE`) is its Buzz identity. Only the CA certificate
 (`AGENT_MITM_PROXY_CA_PUBLISH`) is meant for clients. `.gitignore` covers these names in this
 folder.
 

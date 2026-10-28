@@ -3,13 +3,24 @@
 # Does nothing if something already listens on the port, so it can run on every container start.
 #
 # Configured with the GATEKEEPER_* variables of agent_mitm_proxy.gatekeeper and
-# agent_mitm_proxy.mcp_server; the required ones must be set. Also:
+# agent_mitm_proxy.mcp_server; the required ones must be set. Without GATEKEEPER_KEY_FILE, they
+# come from what the `gatekeeper` command set up (`gatekeeper env`), and when nothing is set up, it
+# says so and does nothing, so it can run on every start of a proxy that doesn't use it. Also:
 #   AGENT_MITM_PROXY_PYTHON  a Python with agent-mitm-proxy installed [python3]
 #   GATEKEEPER_LOG           its output [./data/gatekeeper.log]
 set -Eeuo pipefail
 umask 077
 
 PYTHON="${AGENT_MITM_PROXY_PYTHON:-python3}"
+
+if [[ -z "${GATEKEEPER_KEY_FILE:-}" ]]; then
+  if ! exports=$("${PYTHON}" -m agent_mitm_proxy.gatekeeper_cli env 2>&1); then
+    echo "gatekeeper not started: ${exports#gatekeeper: }" >&2
+    exit 0
+  fi
+  eval "${exports}"
+fi
+
 PORT="${GATEKEEPER_PORT:-8900}"
 LOG="${GATEKEEPER_LOG:-data/gatekeeper.log}"
 export GATEKEEPER_PORT="${PORT}"
